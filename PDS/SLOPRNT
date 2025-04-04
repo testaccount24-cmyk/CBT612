@@ -1,0 +1,463 @@
+SLOPRNT  TITLE 'SYSLOG PRINT UTILITY (DAILY)'
+*
+*---------------------------------------------------------------------*
+*                                                                     *
+*                                                                     *
+*  SLOPRNT5 - SYSLOG PRINTER FOR DAILY SYSLOG                         *
+*             THREE TYPES OF SEARCH SELECTION CAN BE ENTERED          *
+*             IN THE PARAMETER FIELD.                                 *
+*                                                                     *
+*                                                                     *
+*       JCL - //S       EXEC PGM=SLOPRNT1,PARM='..........'           *
+*             //SYSLOG    DD DSN=SYSLOG.DATASET.NAME,DISP=SHR         *
+*             //PRTFILE   DD SYSOUT=*                                 *
+*                                                                     *
+*                                                                     *
+*     PARMS - FORMAT 1 - SEARCH ON DATE AND TIME.                     *
+*                        THE ORDER IS START DATE, FINISH DATE,        *
+*                        START TIME, AND FINISH TIME.                 *
+*                        E.G.  '88242,88243,2357,0011'                *
+*                        E.G.  '2024073,2024073,1659,1804'            *
+*                                                                     *
+*             FORMAT 2 - SEARCH ON STC, TSO, OR JOB NUMBER.           *
+*                        THE SYNTAX IS 'TTT,NNNNN'                    *
+*                        E.G.  'TSU,12345'                            *
+*                                                                     *
+*             FORMAT 3 - SEARCH ON A GIVEN STRING. MAXIMUM IS 20      *
+*                        BYTES.                                       *
+*                                                                     *
+* ENHANCEMENT :                                                       *
+*   1) THE PROGRAM IS MODIFIED TO CHANGE THE RECFM OF PRTFILE FROM    *
+*      FBA TO VBA                                10 OCT 1990 (AC)     *
+*   2) THE PROGRAM IS MODIFIED TO SUPPORT 5 DIGITS JOB NUMBER         *
+*                                                13 MAR 2024 (AC)     *
+*   3) HANDLE SYSLOG DATE FORMAT  YYDDD                               *
+*             OPERLOG DATE FORMAT YYYYDDD                             *
+*                                                20 JUN 2024 (AC)     *
+*                                                                     *
+*---------------------------------------------------------------------*
+*
+SLOPRNT  CSECT
+         STM   14,12,12(13)            * STANDARD
+         LR    12,15                   * ENTRY
+         USING SLOPRNT,12              * TO
+         ST    13,SAVEAREA+4           * PROGRAM
+         LA    13,SAVEAREA
+*
+*
+PARMS    L     R1,0(R1)                * GET PARM LIST ADDR
+         LA    R2,2(R1)                * LOAD PARM LIST ADDR
+         LH    R4,0(R1)                * LOAD PARM LENGTH
+         CHI   R4,27                   * CHECK PARM LENGTH
+         BH    ERROR1                  * GT 27 IS AN ERROR
+*
+         OPEN  (SYSLOG,(INPUT),PRINT,(OUTPUT))
+         LTR   R15,R15
+         BNZ   ABEND0C1
+*
+         MVC   CHK(27),0(R2)           * MOVE PARMS INTO STORAGE
+         CLI   CHK+7,C','              * COMMA IN POS. 8 ?
+         BE    FORMAT1                 * YES, THEN DATE/TIME FORMAT
+         CLI   CHK+3,C','              * COMMA IN POS. 4 ?
+         BE    FORMAT2                 * YES, THEN 'TTT,NNNNN' FORMAT
+         B     FORMAT3                 * OTHERWISE NAMES WILL DO
+*
+*---------------------------------------------------------------------*
+*
+FORMAT1  MVC   SD(7),CHK               * START DATE
+         MVC   FD(7),CHK+8             * FINISH DATE
+*
+         MVC   STH,CHK+16              * START TIME HH
+         CLC   STH,=C'23   '           * CHECK START HOURS LT 23
+         BH    ERROR2                  * GT IS AN ERROR
+*
+         MVC   STM,CHK+18              * START TIME MM
+         CLC   STM,=C'59'              * CHECK START MINUTES LT 59
+         BH    ERROR3                  * GT IS AN ERROR
+*
+         MVC   FTH,CHK+21              * FINISH TIME HH
+         CLC   FTH,=C'23'              * CHECK FINISH HOURS LT 23
+         BH    ERROR4                  * GT IS AN ERROR
+*
+         MVC   FTM,CHK+23             * FINISH TIME MM
+         CLC   FTM,=C'59'              * CHECK FINISH MINUTES LT 59
+         BH    ERROR5                  * GT IS AN ERROR
+*
+TITLES1  SR    R9,R9                   * RESET THE PAGE SKIP COUNTER
+         PUT   PRINT,TITLE1            * PRINT TITLE LINE1
+         PUT   PRINT,BLANKS            * PRINT BLANK LINE
+         MVC   SDATE,SD                * SETUP TITLE LINE2
+         MVC   STIME,STH               * SETUP TITLE LINE2
+         MVC   STIME+3(L'STM),STM      * SETUP TITLE LINE2
+         PUT   PRINT,TITLE2            * PRINT TITLE LINE2
+         MVC   FDATE,FD                * SETUP TITLE LINE3
+         MVC   FTIME,FTH               * SETUP TITLE LINE2
+         MVC   FTIME+3(L'FTM),FTM      * SETUP TITLE LINE2
+         PUT   PRINT,TITLE3            * PRINT TITLE LINE3
+         PUT   PRINT,BLANKS            * PRINT BLANK LINE
+         CLI   FOUND,C'1'              * IS FOUND FLAG ON ?
+         BE    SYSLOG1C                * YES FIND HIGHER VALUE
+***************************************************************
+* SEARCH BY DATE/TIME
+***************************************************************
+SYSLOG1  MVC   RECORD,BLANKS           * CLEAR RECORD
+         GET   SYSLOG,RECORD           * GET SYSLOG
+         CLI   DATMFLD+10,C':'          *
+         BNE   SYSLOG1                 * IGNORE IF NOT EQUAL
+         CLC   FIRST,DATMFLD           * SAVE SYSLOG START  TIME
+         BL    TIME1                   *
+         MVC   FIRST,DATMFLD           *
+TIME1    CLC   LATEST,DATMFLD          * SAVE SYSLOG FINISH TIME
+         BH    TIME2                   *
+         MVC   LATEST,DATMFLD          * AND TIME
+TIME2    CLC   DATMFLD,START           * IS DATE/TIME<START ?
+         BL    SYSLOG1                 * LOWER, GET AGAIN
+         CLC   DATMFLD,FINISH          * IS DATE/TIME>FINISH ?
+         BH    SYSLOG1                 * HIGHER, END
+         PUT   PRINT,RECORD            * PUT TO PRINT
+         MVI   FOUND,C'1'              * SET FOUND FLAG
+         B     LINECT                  *
+SYSLOG1C MVC   RECORD,BLANKS           * CLEAR RECORD
+         GET   SYSLOG,RECORD           * GET SYSLOG
+         CLC   DATMFLD,BLANKS+4        * CHECK FOR MULTIPLE LINE MSG
+         BE    MULTIPLE                * BRANCH IF YES
+         CLI   DATMFLD+8,C':'          *
+         BNE   SYSLOG1E                * IGNORE IF NOT EQUAL
+         CLC   FIRST,DATMFLD           *
+         BL    SYSLOG1D                *
+         MVC   FIRST,DATMFLD           *
+SYSLOG1D CLC   LATEST,DATMFLD          *
+         BH    SYSLOG1E                *
+         MVC   LATEST,DATMFLD          *
+SYSLOG1E DS    0H
+***************************************************************
+* SYSLOG IS NOT STORED AT TIME SEQUENCE, HENCE
+* IT IS NECCESSARY TO SCAN THE ENTIRE DATA SET
+***************************************************************
+         CLC   DATMFLD,FINISH          * IS DATE/TIME>FINISH ?
+         BH    SYSLOG1                 * BRANCH IF HIGHER ?
+         CLC   DATMFLD,START           * IS DATE/TIME<START ?
+         BL    SYSLOG1                 * LOWER, GET AGAIN
+MULTIPLE PUT   PRINT,RECORD            * O.K. PUT TO PRINT
+LINECT   LA    R9,1(R9)                * R9 = R9 + 1
+         CHI   R9,54                   * IS R9 = 54 ?
+         BE    TITLES1                 * YES, ADD TITLES
+         B     SYSLOG1C                * NO, GO AGAIN
+*
+*---------------------------------------------------------------------*
+* SEARCH BY JOB,NNNNN     STC,NNNNN    TSU,NNNNNN
+*---------------------------------------------------------------------*
+FORMAT2  MVC   TYPE(3),CHK             * TYPE - TSU, JOB, OR STC.
+         MVC   NUM,CHK+4               * ID NUMBER
+         CLC   TYPE,=C'STC'            * IS TYPE = STC ?
+         BE    NEXTCHK                 * YES, NOW CHECK NUMBER
+         CLC   TYPE,=C'TSU'            * IS TYPE = TSU ?
+         BE    NEXTCHK                 * YES, NOW CHECK NUMBER
+         CLC   TYPE,=C'JOB'            * IS TYPE = JOB ?
+         BE    NEXTCHK                 * YES, NOW CHECK NUMBER
+         B     ERROR6
+*
+NEXTCHK  CHI   R4,5                    * CHECK MINIMUM LENGTH
+         BL    ERROR7                  * TOO SHORT !!
+         CHI   R4,9                    * IS THE LENGTH 9 CHARS ?
+         BE    TITLES2                 * YES, DO TITLES2
+*
+*---------------------------------------------------------------------*
+*   THIS SECTION OF CODE RIGHT JUSTIFIES THE NUMBER IF IT IS LESS     *
+*   THAN 4 CHARACTERS LONG. THIS IS TO MATCH THE NUMBER JUSTIFICATION *
+*   IN THE SYSLOG.                                                    *
+*---------------------------------------------------------------------*
+*
+         MVC   NUMBER,NUM              * MOVE NUM TO FULLWORD
+         L     R5,NUMBER               * LOAD NUMBER INTO REGISTER
+         LHI   R6,9                    * LOAD MAX PARM LENGTH
+         SLR   R6,R4                   * MINUS REAL LENGTH GIVES
+*                                      * LOOP CONTROL FOR BCT
+*
+RJUST    SRL   R5,8                    * SHIFT 8 BITS RIGHT
+         ST    R5,NUMBER               * STORE IN A WORD
+         MVI   NUMBER,X'40'            * PUT IN A BLANK
+         L     R5,NUMBER               * RETURN TO REGISTER
+         BCT   R6,RJUST                * DO IT AGAIN
+         ST    R5,NUMBER               * MOVE INTO WORD
+         MVC   NUM,NUMBER              * MOVE TO CHARACTER FIELD
+* SELECT BY JOB/STC/TSU NUMBER
+TITLES2  SR    R9,R9                   * ZERO PAGE SKIP COUNTER
+         PUT   PRINT,TITLE1            * PRINT TITLE LINE1
+         PUT   PRINT,BLANKS            * PRINT A BLANK LINE
+         MVC   TTYPE(3),TYPE           * SET UP TITLE LINE2
+         MVC   TNUM,NUM                * SET UP TITLE LINE2
+         PUT   PRINT,TITLE4            * PRINT TITLE LINE2
+         PUT   PRINT,BLANKS            * PRINT A BLANK LINE
+*
+SYSLOG2  MVC   RECORD,BLANKS           * CLEAR RECORD
+         GET   SYSLOG,RECORD           * GET SYSLOG
+         CLC   NUMFLD,NUMSRCH          * TTTNNNNNN MATCH ?
+         BNE   SYSLOG2B                * NO, GET AGAIN
+         MVI   JFOUND,C'Y'             * TURN ON SWITCH
+SYSLOG2A PUT   PRINT,RECORD            * YES, PUT TO PRINT
+         LA    R9,1(R9)                * R9 = R9+1 (PAGE SKIP COUNTER)
+         CHI   R9,54                   * IS R9 = 54 ?
+         BE    TITLES2                 * YES, ADD TITLES
+         B     SYSLOG2                 * NEXT RECORD
+SYSLOG2B CLI   JFOUND,C'Y'             *
+         BNE   SYSLOG2                 *
+         CLC   DATMFLD,BLANKS+4        * CHECK MULTIPLE LINES ?
+         BE    SYSLOG2A                * IF YES WRITE MULTIPLE LINES
+         MVI   JFOUND,C'N'             * TURN OFF SWITCH
+         B     SYSLOG2                 *
+*
+*---------------------------------------------------------------------*
+*
+FORMAT3  CHI   R4,20                   * BRANCH IF NAME IS 20 LONG
+         BE    MAXLEN                  * SKIPPING PADDING SECTION
+         LR    R10,R4                  * MOVE R4 TO R10 FOR 'EX'
+*        S     R10,=F'1'               * SUBTRACT ONE
+         BCTR  R10,0                   * SUBTRACT ONE
+         EX    R10,MVCNAME             * EXECUTE THE MOVE
+         MVC   TNAME,NAMSRCH           * INSERT THE NAME
+         B     TITLES3
+*
+MAXLEN   MVC   NAMSRCH,CHK             * MOVE PARM TO SEARCH FIELD
+         MVC   TNAME,NAMSRCH           * INSERT THE NAME
+*
+TITLES3  SR    R9,R9                   * ZERO PAGE SKIP COUNTER
+         PUT   PRINT,TITLE1            * PRINT TITLE LINE
+         PUT   PRINT,BLANKS            * PRINT BLANK LINE
+         PUT   PRINT,TITLE5            * PRINT TITLE LINE
+         PUT   PRINT,BLANKS            * PRINT BLANK LINE
+*
+SYSLOG3  LHI   R6,137                  * LOAD RECORD LENGTH
+         SR    R6,R4                   * MINUS PARM LEN. FOR BCT CNTL
+         MVC   RECORD,BLANKS           * CLEAR RECORD
+         GET   SYSLOG,RECORD           * GET SYSLOG RECORD
+         LA    R5,RECORD               * ADDR RECORD
+*
+NSEARCH  EX    R10,COMPARE             * EXECUTE THE COMPARE
+         BE    PUTSLOG                 * EQ THEN PUT
+         LA    R5,1(R5)                * INCR. POSITION IN RECORD
+         BCT   R6,NSEARCH              * SEARCH AGAIN
+         B     SYSLOG3
+*
+PUTSLOG  PUT   PRINT,RECORD            * WRITE CURRENT RECORD
+         LA    R9,1(R9)                * INCR LINE COUNTER
+         CHI   R9,54                   * SKIP PAGE ?
+         BE    TITLES3                 * YES, ADD TITLES
+         B     SYSLOG3                 * GO AGAIN
+*
+MVCNAME  MVC   NAMSRCH(0),CHK          * MOVE PARM TO SEARCH ARGUMENT
+COMPARE  CLC   NAMSRCH(0),0(R5)        * COMPARE NAME TO RECORD ?
+*
+*---------------------------------------------------------------------*
+* ERROR MESSAGES                                                      *
+*---------------------------------------------------------------------*
+*
+ERROR1   OPEN  (PRINT,OUTPUT)
+         PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(38),=C'SLO10001 - PARM LENGTH IS INVALID     '
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR2   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(38),=C'SLO10002 - INVALID START HOURS VALUE  '
+         MVC   RECORD+45(2),STH
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR3   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(38),=C'SLO10003 - INVALID START MINUTES VALUE'
+         MVC   RECORD+45(2),STM
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR4   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(38),=C'SLO10004 - INVALID FINISH HOURS VALUE '
+         MVC   RECORD+45(2),FTH
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR5   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(39),=C'SLO10005 - INVALID FINISH MINUTES VALUE'
+         MVC   RECORD+46(2),FTH
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR6   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(36),=C'SLO10006 - INVALID TYPE SPECIFIED - '
+         MVC   RECORD+44(4),TYPE
+         PUT   PRINT,RECORD
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(38),=C'VALID TYPES ARE "TSU", "STC", OR "JOB"'
+         PUT   PRINT,RECORD
+         B     EOF
+*
+ERROR7   PUT   PRINT,TITLE1
+         MVC   RECORD,BLANKS
+         PUT   PRINT,RECORD
+         MVC   RECORD+8(30),=C'SLO10007 - NO NUMBER SPECIFIED'
+         PUT   PRINT,RECORD
+         B     EOF
+*
+*---------------------------------------------------------------------*
+* END ROUTINES                                                        *
+*---------------------------------------------------------------------*
+*
+EOF      DS    0H
+         MVC   LSDATE,FIRST            * SAVE SYSLOG START DATE
+         MVC   LSTIME,FIRST+8          * AND TIME
+         MVC   LFDATE,LATEST           * SAVE SYSLOG ENDING DATE
+         MVC   LFTIME,LATEST+8         * AND TIME
+         CLC   SD,BLANKS+4             * SKIP WRITING TRAILLER IF
+         BE    SKIPTR                  * SD IS BLANK
+         PUT   PRINT,TITLE1            * SKIP TO NEW PAGE
+         PUT   PRINT,TR1               * WRITE TRAILLER RECORD
+         PUT   PRINT,TR2               *
+SKIPTR   CLOSE (PRINT,,SYSLOG)         *
+         L     R13,SAVEAREA+4
+         LM    R14,R12,R12(13)
+         SR    R15,R15
+         BR    R14
+*
+*---------------------------------------------------------------------*
+* CONSTANTS AND STORAGE AREAS                                         *
+*---------------------------------------------------------------------*
+*
+SAVEAREA DS    18F                     * SAVE REGISTERS
+ABEND0C1 DC    F'0'
+*
+CHK      DC    CL27' '                 * PARM CHECK FLD (MAX. 27)
+*
+START    DC    0CL13' '                * FORMAT1 SEARCH  - START
+SD       DC    CL7' '                  * START DATE YYYYJJJ
+         DC    CL1' '                  * FILLER
+STH      DC    CL2' '                  * START TIME HOURS
+         DC    CL1':'                  * COLON
+STM      DC    CL2' '                  * START TIME MINUTES
+*
+FINISH   DC    0CL13' '                * FORMAT1 SEARCH  - FINISH
+FD       DC    CL7' '                  * FINISH DATE YYYYJJJ
+         DC    CL1' '                  * FILLER
+FTH      DC    CL2' '                  * FINISH TIME HOURS
+         DC    CL1':'                  * COLON
+FTM      DC    CL2' '                  * FINISH TIME MINUTES
+*
+FOUND    DC    CL1'0'                  * START TIME FOUND INDICATOR
+JFOUND   DC    CL1'N'                  * JOB FIND SWITCH
+* TTTNNNNN
+NUMSRCH  DC    0CL8' '                 * FORMAT2 SEARCH WITH TYPE
+TYPE     DC    CL3' '                  * - STC/TSU/JOB
+NUM      DC    CL5' '                  * - NUMBER
+*
+NUMBER   DS    F                       * WORD FOR NUMBER ADJUSTMENT
+*
+NAMSRCH  DC    CL20' '                 * FORMAT3 SEARCH WITH STRING
+*
+*   STORAGE DEFINING INPUT RECORD FROM SYSLOG DATASET
+*   OPERLOG FORMAT
+RECORD   DS    0CL137               * SYSLOG RECORD (133 + 4 FOR VB)
+         DS    CL4                  *
+         DS    C                    * ATTRIBUTE
+RECTYPE  DS    CL2           1  5   * RECORD TYPE
+         DS    CL17          3  7   * FILL
+DATMFLD  DS    CL13         20  24  * SEARCH FIELD FOR 'YYYYDDD HH:MM'
+         DS    CL7          33  37  * FILL
+NUMFLD   DS    CL8          40  44  * SEARCH FIELD FOR 'TTTNNNNN'
+         DS    CL85         48  52   * FILL
+*
+TITLE1   DC    H'122'
+         DC    H'0'
+         DC    CL1'1'
+         DC    CL15' '
+         DC    CL40'*--------------------------------------*'
+         DC    CL22'   SYSLOG     PRINT   '
+         DC    CL40'*--------------------------------------*'
+*
+TITLE2   DC    H'113'
+         DC    H'0'
+         DC    CL23' '
+         DC    CL20'INPUT  START DATE = '
+SDATE    DC    CL7' '
+         DC    CL34' '
+         DC    CL20'INPUT  START TIME = '
+STIME    DC    CL5'  :  '
+*
+TITLE3   DC    H'113'
+         DC    H'0'
+         DC    CL23' '
+         DC    CL20'INPUT FINISH DATE = '
+FDATE    DC    CL7' '
+         DC    CL34' '
+         DC    CL20'INPUT FINISH TIME = '
+FTIME    DC    CL5'  :  '
+*
+TITLE4   DC    H'65'
+         DC    H'0'
+         DC    CL29' '
+         DC    CL14'OCCURENCES OF '
+TTYPE    DC    CL3' '
+         DC    CL10' NUMBER = '
+TNUM     DC    CL5' '
+*
+TITLE5   DC    H'75'
+         DC    H'0'
+         DC    CL29' '
+         DC    CL22'OCCURENCES OF STRING; '
+TNAME    DC    CL20' '
+TR1      DC    H'113'
+         DC    H'0'
+         DC    CL22' '
+         DC    CL21'SYSLOG  START DATE = '
+LSDATE   DC    CL7' '
+         DC    CL33' '
+         DC    CL21'SYSLOG  START TIME = '
+LSTIME   DC    CL5' '
+*
+TR2      DC    H'113'
+         DC    H'0'
+         DC    CL22' '
+         DC    CL21'SYSLOG FINISH DATE = '
+LFDATE   DC    CL7' '
+         DC    CL33' '
+         DC    CL21'SYSLOG FINISH TIME = '
+LFTIME   DC    CL5' '
+*
+BLANKS   DC    H'137',H'0',CL133' '
+FIRST    DC    CL13'9999999999999'
+LATEST   DC    CL13'0000000000000'
+*
+*---------------------------------------------------------------------*
+* DCB'S                                                               *
+*---------------------------------------------------------------------*
+*
+*    INPUT FILES
+*
+SYSLOG   DCB   DDNAME=SYSLOG,                                          C
+               MACRF=GM,                                               C
+               DSORG=PS,                                               C
+               RECFM=VBA,                                              C
+               LRECL=137,BLKSIZE=32760,                                C
+               EODAD=EOF
+*
+*   OUTPUT FILES
+*
+PRINT    DCB   DDNAME=PRTFILE,                                         C
+               MACRF=PM,                                               C
+               DSORG=PS,                                               C
+               RECFM=VBA,                                              C
+               LRECL=137
+*
+         YREGS
+         END

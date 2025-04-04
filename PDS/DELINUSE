@@ -1,0 +1,712 @@
+*---------------------------------------------------------------------*
+*                    D E L I N U S E                                  *
+*---------------------------------------------------------------------*
+*                                                                     *
+* FUNCTION     :  A PGM TO DELETE DATASETS THAT ARE IN USE ELSEWHERE  *
+*                 (I.E. AN ENQ FOR SYSDSN DSNAME EXISTS)              *
+*                                                                     *
+* PARM FIELD   :  NO PARMS                                            *
+*                            DELETE DATASETS NAMED IN THE CARDS FILE  *
+*                 IF THE VOLUME THEY RESIDE ON IS NOT IN USE. THIS IS *
+*                 SAFE, IF THE VOLUME IS NOT IN USE THEN THIS COPY    *
+*                 OF THE DATASET CANNOT BE THE ACTIVE ONE.            *
+*                                                                     *
+*              :  PARM=FORCE                                          *
+*                            DELETE DATASETS NAMED IN THE CARDS FILE  *
+*                 EVEN IF THE VOLUME IS IN USE BY OTHERS.             *
+*                                                                     *
+* EXECUTION JCL:                                                      *
+*                                                                     *
+*  //      EXEC PGM=DELINUSE,PARM=FORCE                               *
+*  //SYSPRINT DD SYSOUT=*                             REQUIRED BY DSF *
+*  //SYSIN    DD UNIT=SYSDA,SPACE=(TRK,1)             REQUIRED BY DSF *
+*  //VTOC     DD UNIT=3380,VOL=SER=VOLSER,DISP=SHR    THIS VOLUME     *
+*  //REPORT   DD SYSOUT=*                             REPORT FILE     *
+*  //CARDS    DD *                                DATASETS TO SCRATCH *
+*  SYS1.HELP                                                          *
+*  SYS1.MACLIB                                                        *
+*  /*                                                                 *
+*                                                                     *
+* RETURN CODES :  ALL RETURN CODES OTHER THAN ZERO WILL JE            *
+*                 ACCOMPANIED BY A MESSAGE WRITTEN THE REPORT FILE.   *
+*                                                                     *
+* ABENDS       :  U0001  RDJFCB OF VTOC DDNAME HAS FAILED             *
+*                        R15 CONTAINS RETURN CODE FROM RDJFCBN.       *
+*                                                                     *
+*                 U0002  OPEN OF VTOC DCB HAS FAILED                  *
+*                        R15 CONTAINS RETURN CODE FROM OPEN.          *
+*                                                                     *
+*                 U0003  UNEXPECTED RETURN CODE FROM CVAFTST.         *
+*                        R15 CONTAINS RETURN CODE FROM CVAFTST.       *
+*                                                                     *
+*                 U0004  NON ZERO RETURN CODE FROM SCRATCH MACRO.     *
+*                        R15 CONTAINS RETURN CODE FROM SCRATCH.       *
+*                        R2  CONTAINS STATUS CODE FROM SCRATCH.       *
+*                        R3  CONTAINS ADDRESS OF DSN INVOLVED.        *
+*                                                                     *
+*                 U0005  ERROR DISABLING VTOC INDEX.                  *
+*                        SEE OUTPUT FROM DSF                          *
+*                                                                     *
+*                 U0006  ERROR ENABLING VTOC INDEX.                   *
+*                        SEE OUTPUT FROM DSF                          *
+*                                                                     *
+*                 U0007  VOLUME IN USE BY SOMEONE ELSE. USE THE FORCE *
+*                        PARM IF YOU STILL WANT TO DO IT.             *
+*                                                                     *
+*                 U0999  INTERNAL ERROR. THE DSNFLAG FIELD FOR A      *
+*                        DATASET HAS A COMBINATION OF BITS SET THAT   *
+*                        SHOULD NOT OCCUR. A LOGIC ERROR?             *
+*---------------------------------------------------------------------*
+         EJECT
+DELINUSE CSECT
+         STM   R14,R12,12(R13)     SAVE CALLERS REGS
+         LR    R12,R15             GET ENTRY ADDR
+         LA    R11,4095(0,R12)     LOAD 2ND BASE
+         LA    R11,1(0,R11)        LOAD 2ND BASE
+         USING DELINUSE,R12,R11    ADDRESSABILITY
+         LA    R2,SAVEAREA         GET MY SAVE AREA ADDR
+         ST    R13,4(0,R2)         CHAIN LSA TO HSA
+         ST    R2,8(0,R13)         CHAIN HSA TO LSA
+         LR    R13,R2              LOAD NEW SAVE AREA ADDR
+*
+         L     R1,0(0,R1)          GET PARM PTR
+         JAS   R14,LBL100          GO LOAD INPUT FILE
+         LTR   R15,R15             ANY WORK TO DO ?
+         JNZ   LBL090              NO.  BRANCH
+         SR    R1,R1               INDICATE VTOC READ PASS
+         JAS   R14,LBL400          GO SCAN VTOC
+         TM    PGMFLAG,DSNFOUND    ANY DATASETS TO PROCESS ?
+         JO    LBL050              YES. BRANCH
+         LA    R1,MSG22            GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         LHI   R15,12              SET RETURN CODE
+         J     LBL090              BRANCH
+LBL050   DS    0H
+         SR    R1,R1               INDICATE DISABLE VTOCIX
+         JAS   R14,LBL200          DISABLE VTOCIX (IF INDEXED)
+         SR    R1,R1               INDICATE ENQ/RESERVE
+         JAS   R14,LBL300          GO ENQ/RESERVE VTOC
+         LHI   R1,1                UPDATE VTOC THIS TIME
+         JAS   R14,LBL400          GO RENAME DATASETS
+         LHI   R1,1                INDICATE DEQ VTOC
+         JAS   R14,LBL300          GO DEQ VTOC
+         JAS   R14,LBL500          GO SCRATCH VTOC ENTRIES
+         LHI   R1,1                INDICATE DEQ VTOC
+         JAS   R14,LBL200          GO ENABLE VTOCIX
+         JAS   R14,LBL600          GO PRINT RUN SUMMARY
+LBL090   DS    0H
+         LR    R2,R15              SAVE RETURN CODE
+         TM    PGMFLAG,REPTOPEN    IS REPORT FILE OPEN
+         JZ    LBL095              NO.  BRANCH
+         CLOSE REPORT              YES. CLOSE REPORT FILE
+LBL095   DS    0H
+         LR    R15,R2              SET RETURN CODE
+         L     R13,4(0,R13)        RESTORE HSA ADDR
+         L     R14,12(R13)         RESTORE REGS
+         LM    R0,R12,20(R13)      RESTORE REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*                   PARM FILE PROCESSING                              *
+*---------------------------------------------------------------------*
+*      INPUT    R1 -> PARM STRING                                     *
+*      OUTPUT   R15 =  0 = ALL OK                                     *
+*                      4 = BAD PARM FIELD                             *
+*                      8 = NO INPUT                                   *
+*                     12 = TO MANY DSNS                               *
+*---------------------------------------------------------------------*
+LBL100   DS    0H
+         STM   R0,R14,LBL100SV     SAVE CALLERS REGS
+         LTR   R1,R1               ANY PARM FIELD
+         JZ    LBL110              NO.  BRANCH
+         LH    R2,0(0,R1)          GET LENGTH OF PARM
+         LTR   R2,R2               ANY PARM ?
+         JZ    LBL110              NO.  BRANCH
+         CHI   R2,5                PARM THE RIGHT LENGTH ?
+         JNE   LBL105              NO.  BRANCH
+         CLC   =C'FORCE',2(R1)     YES. PARM = FORCE  ?
+         JNE   LBL105              NO.  BRANCH
+         OI    PGMFLAG,FORCE       INDICATE FORCE SET
+         LA    R1,MSG19            GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL110              BRANCH
+LBL105   DS    0H
+         LA    R1,MSG1             GET ADDR OF ERROR MSG
+         JAS   R14,LBL900          GO WRITE MSG
+         LHI   R15,12              SET BAD RETURN CODE
+         J     LBL190              BRANCH
+LBL110   DS    0H
+         OPEN  CARDS               OPEN CONTROL CARD FILE
+         LA    R9,DSNAMES          GET ADDR OF DSN ARRAY
+         USING DSNMAP,R9           MAP DSN ARRAY
+         SR    R8,R8               COUNT THE NUMBER OF DSNS
+         LA    R7,DSNMAX           GET MAX SIZE OF ARRAY
+LBL120   DS    0H
+         GET   CARDS,INREC         GET A RECORD
+         MVC   0(44,R9),INREC      PUT DSN IN ARRAY
+         LA    R8,1(0,R8)          COUNT DSNS
+         LA    R9,DSNMAPL(0,R9)    POINT TO NEXT ARRAY ENTRY
+         JCT   R7,LBL120           LOOP THRU INPUT FILE
+         LA    R1,MSG3             GET ADDR OF MSG
+         JAS   R14,LBL900          GO WRITE MSG
+         LHI   R15,12              TO MANY DSNS
+         J     LBL190              BRANCH
+         DROP  R9                  DSN ARRAY MAP
+LBL130   DS    0H
+         CLOSE CARDS               CLOSE INPUT FILE
+         SR    R15,R15             SET 0 RETURN CODE
+         ST    R8,NUMBDSNS         SAVE DSN COUNT
+         LTR   R8,R8               ANY RECORDS ?
+         JNZ   LBL190              YES. BRANCH
+         LA    R1,MSG2             GET ADDR OF MSG
+         JAS   R14,LBL900          GO WRITE MSG
+         LHI   R15,12              SET BAD RETURN CODE
+LBL190   DS    0H
+         LM    R0,R14,LBL100SV     RESTORE REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*              DISABLE / ENABLE VTOC INDEX                            *
+*---------------------------------------------------------------------*
+*      INPUT    R1  =  0  = DISABLE VTOC INDEX                        *
+*                   =  1  = ENABLE VTOC INDEX                         *
+*---------------------------------------------------------------------*
+*      OUTPUT   R15 =  0 = ALL OK                                     *
+*---------------------------------------------------------------------*
+LBL200   DS    0H
+         STM   R0,R14,LBL200SV     SAVE CALLERS REGS
+*
+         LTR   R1,R1               DISABLE INDEX ?
+         JNZ   LBL250              NO.  BRANCH
+         SR    R0,R0               INDICATE OPEN REQUIRED
+         SR    R1,R1               INDICATE INPUT OPEN ONLY
+         JAS   R14,LBL800          GO OPEN VTOC
+         LHI   R0,1                INDICATE CLOSE VTOC
+         JAS   R14,LBL800          GO CLOSE VTOC
+*
+         L     R2,UCBADDR          GET ADDR OF UCB
+         CVAFTST UCB=(R2)          TEST FOR ACTIVE VTOC INDEX
+         CHI   R15,8               IS INDEX ACTIVE ?
+         JE    LBL210              YES. BRANCH
+         CHI   R15,4               NO . BRANCH
+         JE    LBL290              YES. BRANCH
+         LA    R1,MSG6             GET ERROR MSG ADDR
+         JAS   R14,LBL900          GO WRITE ERROR MSG ?
+         ABEND 3,DUMP
+LBL210   DS    0H                  VTOC INDEX ACTIVE
+         OI    PGMFLAG,INDEXACT    INDICATE INDEX IS ACTIVE
+         OPEN  (SYSIN,(OUTPUT))    OPEN DSF INPUT FILE
+         PUT   SYSIN,OSVTOC        WRITE CONTROL CARD TO SYSIN
+         CLOSE SYSIN               CLOSE SYSIN
+         SR    R1,R1               NO PARMS TO DSF
+         LINK  EP=ICKDSF           INVOKE DSF
+         LTR   R15,R15             DSF OK ?
+         JZ    LBL290              YES. BRANCH
+         LA    R1,MSG7             NO.  GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         ABEND 5,DUMP              DRAW ATTENTION TO THE ERROR
+*
+LBL250   DS    0H
+         TM    PGMFLAG,INDEXACT    WAS THERE AN ACTIVE INDEX ON VOL ?
+         JZ    LBL290              NO.  BRANCH
+         OPEN  (SYSIN,(OUTPUT))    OPEN DSF INPUT FILE
+         PUT   SYSIN,IXVTOC        WRITE CONTROL CARD TO SYSIN
+         CLOSE SYSIN               CLOSE SYSIN
+         SR    R1,R1               NP PARMS TO DSF
+         LINK  EP=ICKDSF           INVOKE DSF
+         LTR   R15,R15             DSF OK ?
+         JZ    LBL290              YES. BRANCH
+         LA    R1,MSG8             NO. ADDR OF MSG
+         JAS   R14,LBL900          WRITE MSG
+         ABEND 6,DUMP              DRAW ATTENTION TO THE ERROR
+*
+LBL290   DS    0H
+         LM    R0,R14,LBL200SV     RESTORE REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*       SERIALIZE ACCESS TO VTOC (AND DASD IF SHARED)                 *
+*---------------------------------------------------------------------*
+*      INPUT    R1 =  0  = ENQ/RESERVE VTOC                           *
+*                  =  1  = DEQ VTOC                                   *
+*---------------------------------------------------------------------*
+*      OUTPUT   R15 =  0 = ALL OK                                     *
+*---------------------------------------------------------------------*
+LBL300   DS    0H
+         STM   R0,R14,LBL300SV     SAVE CALLERS REGS
+*
+         LTR   R1,R1               RESERVE VTOC ?
+         JNZ   LBL350              NO.  BRANCH
+*
+         MVC   RNAME,VOLSER        SET UP RNAME FOR ENQ/RESERVE
+         TM    PGMFLAG,SHRDDASD    IS DASD SHARED ?
+         JZ    LBL340              NO. BRANCH
+         RESERVE (QNAME,RNAME,E,L'RNAME,SYSTEMS),UCB=UCBADDR
+         MVC   MSG14+8(6),RNAME    PUT VOLSER IN MSG
+         LA    R1,MSG14            GET MESSAGE ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL390              BRANCH
+*
+LBL340   DS    0H
+         ENQ   (QNAME,RNAME,E,L'RNAME,SYSTEM)
+         MVC   MSG15+8(6),RNAME    PUT VOLSER IN MSG
+         LA    R1,MSG15            GET MESSAGE ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL390              BRANCH
+*
+LBL350   DS    0H
+         TM    PGMFLAG,SHRDDASD    IS DASD SHARED ?
+         JZ    LBL360              NO. BRANCH
+         DEQ   (QNAME,RNAME,L'RNAME,SYSTEMS),UCB=UCBADDR
+         MVC   MSG17+8(6),RNAME    PUT VOLSER IN MSG
+         LA    R1,MSG17            GET MESSAGE ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL390              BRANCH
+*
+LBL360   DS    0H
+         DEQ   (QNAME,RNAME,L'RNAME,SYSTEM)
+         MVC   MSG16+8(6),RNAME    PUT VOLSER IN MSG
+         LA    R1,MSG16            GET MESSAGE ADDR
+         JAS   R14,LBL900          WRITE MSG
+*
+LBL390   DS    0H
+         SR    R15,R15             SET 0 RETURN CODE
+         LM    R0,R14,LBL300SV     RESTORE REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*              VTOC READ / UPDATE PROCESSING                          *
+*---------------------------------------------------------------------*
+*      INPUT    R1 =  0  = SCAN THRU VTOC FOR MATCHING DSNS           *
+*                  =  1  = SCAN THRU VTOC RENAMING MATCHING DSNS      *
+*---------------------------------------------------------------------*
+*      OUTPUT   R15 =  0 = ALL OK                                     *
+*---------------------------------------------------------------------*
+LBL400   DS    0H
+         STM   R0,R14,LBL400SV     SAVE CALLERS REGS
+*
+         LR    R10,R1              SAVE PARM
+         SR    R0,R0               INDICATE OPEN REQUIRED
+         JAS   R14,LBL800          GO OPEN VTOC
+*
+         LA    R5,DSCBAREA         GET ADDR OF VTOC ENTRY
+         USING IECSDSL1,R5         MAP VTOC ENTRY
+*
+LBL410   DS    0H
+         READ  DECB,SF,VTOCDCB,DSCBAREA,140,MF=E
+         CHECK DECB                WAIT FOR READ TO COMPLETE
+         CLI   DS1FMTID,C'1'       IS IT A FORMAT 1 ?
+         JNE   LBL410              NO.  BRANCH
+*
+         LA    R9,DSNAMES          GET DSNAME ARRAY ADDR
+         USING DSNMAP,R9           MAP DSNAME ARRAY
+         L     R8,NUMBDSNS         GET # OF ENTRIES
+LBL420   DS    0H
+         CLC   DS1DSNAM,DSN        IS THIS A DSN TO JE PROCESSED
+         JE    LBL430              YES. BRANCH
+         LA    R9,DSNMAPL(0,R9)    POINT TO NEXT DSNAME
+         JCT   R8,LBL420           LOOP THRU ARRAY
+         J     LBL410              LOOP THRU VTOC
+*
+LBL430   DS    0H
+         OI    PGMFLAG,DSNFOUND    INDICATE DSN FOUND IN VTOC
+         LTR   R10,R10             RENAME PASS ?
+         JZ    LBL480              NO.  BRANCH
+         OI    DSNFLAG,FOUND       INDICATE DSN FOUND IN VTOC
+         LA    R7,DS1DSNAM         GET VTOC DSNAME ADDR
+         LHI   R6,42               SET MAX SIZE OF DSN
+LBL440   DS    0H
+         CLI   0(R7),C' '          END OF DSN?
+         JE    LBL450              YES. BRANCH
+         LA    R7,1(0,R7)          POINT TO NEXT DSN CHAR
+         JCT   R6,LBL440           LOOP THRU DSN
+         OI    DSNFLAG,DSNLONG     INDICATE DSN TOO LONG
+         J     LBL410              BRANCH
+*
+LBL450   DS    0H
+         MVC   0(2,R7),=CL2'.$'    CHANGE DSNAME BY SUFFIXING WITH .$
+         WRITE DECB,SF,VTOCDCB,DSCBAREA,140,MF=E
+         CHECK DECB                WAIT FOR IO TO COMPLETE
+         OI    DSNFLAG,DSNREN      SET DSN RENAMED FLAG
+         MVC   DSNPREN,DS1DSNAM    SAVE NEW NAME OF DATASET
+         J     LBL410              BRANCH
+*
+LBL480   DS    0H                  END OF FILE ON VTOC
+         LHI   R0,1                INDICATE CLOSE REQUIRED
+         JAS   R14,LBL800          GO CLOSE VTOC
+*
+LBL490   DS    0H
+         LM    R0,R14,LBL400SV     RESTORE CALLERS REGS
+         BR    R14                 RETURN TO CALLER
+         DROP  R5                  DSCB ADDR
+         EJECT
+*---------------------------------------------------------------------*
+*              SCRATCH THE RENAMED VTOC ENTRIES                       *
+*---------------------------------------------------------------------*
+LBL500   DS    0H
+         STM   R0,R14,LBL500SV     SAVE CALLERS REGS
+         L     R8,NUMBDSNS         GET NUMBER OF ENTRIES
+         LA    R9,DSNAMES          GET ADDR OF DSNAME ARRAY
+         USING DSNMAP,R9           MAP DSN ARRAY
+LBL510   DS    0H
+         TM    DSNFLAG,DSNREN      DID WE RENAME THIS DATASET ?
+         JO    LBL530              YES. BRANCH
+LBL520   DS    0H
+         LA    R9,DSNMAPL(0,R9)    POINT TO NEXT ENTRY IN ARRAY
+         JCT   R8,LBL510           LOOP THRU ARRAY
+         J     LBL590              BRANCH
+*
+LBL530   DS    0H
+         MVC   SCRDSN,DSNPREN      PUT DSN IN PARM LIST
+         MVC   SCRVOL,VOLSER       PUT VOLSER IN SCRATCH PARM LIST
+         SR    R0,R0               REQUIRED FOR SCRATCH
+         SCRATCH SCRLIST           SCRATCH IT
+         LTR   R15,R15             SCRATCH OK ?
+         JZ    LBL540              YES. BRANCH
+         OI    DSNFLAG,SCRFAIL     INDICATE SCRATCH OK ?
+         LH    R2,STATUS           GET RETURN CODE
+         LR    R3,R9               GET DSNAME
+         ABEND 4,DUMP              DEBUG
+*
+LBL540   DS    0H
+         OI    DSNFLAG,SCROK       INDICATE SCRATCH OK ?
+         J     LBL520              GO GET NEXT DSNAME
+*
+LBL590   DS    0H
+         LM    R0,R14,LBL500SV     RESTORE CALLERS REGS
+         BR    R14                 RETURN TO CALLER
+         DROP  R9                  DROP DSN ARRAY MAP
+         EJECT
+*---------------------------------------------------------------------*
+*             PRINT RUN REPORT                                        *
+*---------------------------------------------------------------------*
+LBL600   DS    0H
+         STM   R0,R14,LBL600SV     SAVE CALLERS REGS
+         L     R8,NUMBDSNS         GET NUMBER OF ENTRIES
+         LA    R9,DSNAMES          GET ADDR OF DSNAME ARRAY
+         USING DSNMAP,R9           MAP DSN ARRAY
+LBL610   DS    0H
+         TM    DSNFLAG,FOUND       WAS DSN FOUND IN VTOC  ?
+         JZ    LBL630              NO . BRANCH
+         TM    DSNFLAG,DSNLONG     WAS DSN TO LONG ?
+         JO    LBL660              YES. BRANCH
+         TM    DSNFLAG,SCROK       WAS DSN SCRATCHED ?
+         JO    LBL640              YES. BRANCH
+         TM    DSNFLAG,SCRFAIL     DSN SCRATCH FAILED ?
+         JO    LBL650              NO . BRANCH
+         ABEND 999,DUMP            INTERNAL ERROR ?
+LBL620   DS    0H
+         LA    R9,DSNMAPL(0,R9)    POINT TO NEXT ENTRY IN ARRAY
+         JCT   R8,LBL610           LOOP THRU ARRAY
+         J     LBL690              BRANCH
+*
+LBL630   DS    0H                  DSN NOT FOUND
+         OI    RETCODE,RC04        SET WARNING RETURN CODE
+         MVC   MSG11+30(44),DSN    PUT DSN IN MSG
+         LA    R1,MSG11            GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL620              LOOP THRU ARRAY
+*
+LBL640   DS    0H                  DSN SCRATCHED
+         MVC   MSG12+29(44),DSN    PUT DSN IN MSG
+         LA    R1,MSG12            GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL620              LOOP THRU ARRAY
+*
+LBL650   DS    0H                  DSN SCRATCH FAILED
+         OI    RETCODE,RC12        SET WARNING RETURN CODE
+         MVC   MSG13+29(44),DSN    PUT DSN IN MSG
+         LA    R1,MSG13            GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL620              LOOP THRU ARRAY
+*
+LBL660   DS    0H                  DSN TOO LONG TO SUFFIX
+         OI    RETCODE,RC08        SET WARNING RETURN CODE
+         MVC   MSG9+45(44),DSN     PUT DSNAME IN MSG
+         LA    R1,MSG9             GET MSG ADDR
+         JAS   R14,LBL900          WRITE MSG
+         J     LBL620              LOOP THRU ARRAY
+*
+LBL690   DS    0H                  DSN NOT FOUND
+         LHI   R15,12              ASSUME RC = 12
+         TM    RETCODE,RC12        RC 12 ?
+         JO    LBL695              YES. BRANCH
+         LHI   R15,8               ASSUME RC = 8
+         TM    RETCODE,RC08        RC 08 ?
+         JO    LBL695              YES. BRANCH
+         LHI   R15,4               ASSUME RC = 4
+         TM    RETCODE,RC04        RC 4  ?
+         JO    LBL695              YES. BRANCH
+         SR    R15,R15             SET 0 RETURN CODE
+LBL695   DS    0H
+         LM    R0,R14,LBL600SV     RESTORE CALLERS REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*               VTOC OPEN AND CLOSE PROCESSING                        *
+*---------------------------------------------------------------------*
+*      INPUT    R0 =  0  = OPEN OF  VTOC REQUIRED                     *
+*                  =  1  = CLOSE OF VTOC REQUIRED                     *
+*               R1 =  0  = OPEN FOR INPUT                             *
+*                  =  1  = OPEN FOR UPDATE                            *
+*---------------------------------------------------------------------*
+*      OUTPUT   R15 =  0 = ALL OK                                     *
+*---------------------------------------------------------------------*
+LBL800   DS    0H
+         STM   R0,R14,LBL800SV     SAVE CALLERS REGS
+*
+         LR    R2,R1               SAVE PARM
+         LTR   R0,R0               OPEN REQUIRED ?
+         JNZ   LBL860              NO.  BRANCH
+*
+         RDJFCB (VTOCDCB)          GET A COPY OF JFCB FOR VTOC
+         LTR   R15,R15             OK ?
+         JZ    LBL810              YES. BRANCH
+         LA    R1,MSG4             GET ADDR OF MSG
+         JAS   R14,LBL900          GO WRITE MSG
+         ABEND 1,DUMP
+LBL810   DS    0H
+         LA    R9,JFCBAREA         GET ADDR OF JFCB
+         USING JFCB,R9             MAP JFCB
+         MVC   JFCBDSNM,=44X'04'   INSERT VTOC DSNAME
+         DROP  R9                  DROP JFCB
+         LA    R8,VTOCDCB          GET DCB ADDR
+         USING IHADCB,R8           MAP DCB
+         LTR   R2,R2               OPEN FOR INPUT ?
+         JNZ   LBL820              NO.  BRANCH
+         OPEN  (VTOCDCB,(INPUT)),TYPE=J
+         TM    DCBOFLGS,DCBOFOPN   OPEN OK ?
+         JO    LBL840              YES. BRANCH
+         J     LBL830              BRANCH
+LBL820   DS    0H
+         OPEN  (VTOCDCB,(UPDATE)),TYPE=J
+         TM    DCBOFLGS,DCBOFOPN   OPEN OK ?
+         JO    LBL840              YES. BRANCH
+LBL830   DS    0H
+         LA    R1,MSG5             GET ADDR OF MSG
+         JAS   R14,LBL900          GO WRITE MSG
+         ABEND 2,DUMP              VTOC OPEN FAILURE
+LBL840   DS    0H
+         OI    PGMFLAG,VTOCOPEN    INDICATE VTOC IS OPEN
+         MVC   DEBADDR,DCBDEBA     GET VTOC DEB ADDR FOR LATER
+         SR    R9,R9               CLEAR R9
+         ICM   R9,B'0111',DCBDEBA  GET DEB ADDR FROM DCB
+         USING DEBBASIC,R9         MAP DEB
+         DROP  R8                  DROP DCB PTR
+         SR    R8,R8               CLEAR R8
+         ICM   R8,B'0111',DEBSUCBB GET UCB ADDR FROM DEB
+         ST    R8,UCBADDR          SAVE UCB ADDR
+         USING UCBCMSEG,R8         MAP UCB
+         LH    R1,UCBUSER          GET USE COUNT FOR VOLUME
+         CHI   R1,1                ANY OTHER USERS ?
+         JNH   LBL850              NO.  BRANCH
+         TM    PGMFLAG,FORCE       YES. WAS FORCE SPECIFIED?
+         JZ    LBL845              NO.  BRANCH
+         TM    PGMFLAG,FWARNMSG    YES. MSG ALREADY ISSUED ?
+         JO    LBL850              YES. BRANCH
+         LA    R1,MSG20            NO.  TELL USER
+         JAS   R14,LBL900          WRITE MSG
+         OI    PGMFLAG,FWARNMSG    INDICATE WARNING MSG ISSUED
+         J     LBL850              BRANCH
+LBL845   DS    0H
+         LA    R1,MSG21            YES. TELL USER
+         JAS   R14,LBL900          WRITE MSG
+         ABEND 7,DUMP              CALL IT OFF
+LBL850   DS    0H
+         MVC   VOLSER,UCBVOLI      GET VOLSER OF DASD
+         MVC   UCBTYPE,UCBTYP      SAVE UCB DEVICE TYPE FOR LATER
+         SR    R15,R15             SET 0 RETURN CODE
+         TM    UCBTBYT2,UCBRR      SHARED DASD ?
+         JZ    LBL890              NO.  BRANCH
+         OI    PGMFLAG,SHRDDASD    YES. SET FLAG
+         J     LBL890              BRANCH
+         DROP  R8                  DROP UCB
+         DROP  R9                  DROP DEB
+LBL860   DS    0H
+         CLOSE VTOCDCB             CLOSE VTOC
+LBL890   DS    0H
+         LM    R0,R14,LBL800SV     RESTORE CALLERS REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*               REPORT FILE PROCESSING                                *
+*---------------------------------------------------------------------*
+*        INPUT  R1-> MSG                                              *
+*---------------------------------------------------------------------*
+LBL900   DS    0H
+         STM   R0,R14,LBL900SV     SAVE CALLERS REGS
+*
+         LR    R2,R1               GET  MSG ADDR
+         TM    PGMFLAG,REPTOPEN    IS REPORT OPEN ?
+         JO    LBL910              YES. BRANCH
+         OPEN  (REPORT,(OUTPUT))   NO.  OPEN IT
+         OI    PGMFLAG,REPTOPEN    SETOPEN PGMFLAG
+LBL910   DS    0H
+         PUT   REPORT,(R2)         WRITE MSG
+*
+         LM    R0,R14,LBL900SV     RESTORE CALLERS REGS
+         BR    R14                 RETURN TO CALLER
+         EJECT
+*---------------------------------------------------------------------*
+*                 LIST FORMS OF MACROS                                *
+*---------------------------------------------------------------------*
+SCRLIST  CAMLST SCRATCH,SCRDSN,,VOLLIST,,OVRD
+         READ  DECB,SF,MF=L
+*---------------------------------------------------------------------*
+*                  PROGRAM VARIABLES                                  *
+*---------------------------------------------------------------------*
+NUMBDSNS DS    F                   COUNT OF DSNS IN ARRAY
+INREC    DS    CL80                INPUT BUFFER FOR CARDS FILE
+UCBADDR  DS    F                   ADDR OF UCB FOR THE VOL WE ARE DOING
+DEBADDR  DS    F                   ADDR OF DEB FOR VTOC
+OSVTOC   DC    CL80'    BUILDIX DDNAME(VTOC) OSVTOC'   DSF CONTROL CARD
+IXVTOC   DC    CL80'    BUILDIX DDNAME(VTOC) IXVTOC'   DSF CONTROL CARD
+QNAME    DC    CL8'SYSVTOC'        ENQ QNAME FOR EXCLUSIVE VTOC ACCESS
+RNAME    DS    CL6                 RNAME IS VOLSER
+DSNAME   DS    CL44
+SCRDSN   DS    CL44
+VOLSER   DS    CL6
+JFCBADDR DS    0F
+         DC    X'87',AL3(JFCBAREA)
+JFCBAREA DC    XL176'0'
+         DC    C'DSCB'
+DSCBAREA DC    XL140'FF'
+VOLLIST  DC    H'1'
+UCBTYPE  DS    XL4
+SCRVOL   DS    CL6
+STATUS   DS    XL2
+         LTORG
+*---------------------------------------------------------------------*
+*                                                                     *
+*---------------------------------------------------------------------*
+DSNMAX   EQU   20
+DSNAMES  DC    (DSNMAX)XL(DSNMAPL)'0'  DSNAME ARRAY
+*
+DSNMAP   DSECT
+DSN      DS    CL44                DSNAME
+DSNPREN  DS    CL44                DSNAME AFTER RENAME
+DSNFLAG  DS    F                   FLAG BYTE
+FOUND    EQU   X'80'               DATASET RENAMED SUCCESSFULLY
+DSNREN   EQU   X'40'               DATASET RENAMED SUCCESSFULLY
+SCROK    EQU   X'20'               DATASET SCRATCHED
+SCRFAIL  EQU   X'10'               DATASET SCRATCH FAILED
+DSNLONG  EQU   X'08'               DSN TOO LONG TO ADD SUFFIX
+*
+DSNMAPL  EQU   *-DSNMAP            LENGTH OF AN ENTRY
+DELINUSE CSECT
+*---------------------------------------------------------------------*
+*              FLAG BYTE FOR THIS  PGM                                *
+*---------------------------------------------------------------------*
+PGMFLAG  DC    X'00'               PGM CONTROL SWITCHES
+REPTOPEN EQU   X'80'               REPORT IS OPEN
+FORCE    EQU   X'40'               FORCE OPTION USED
+INDEXACT EQU   X'20'               VOLUME CONTAINS ACTIVE IVTOC INDEX
+VTOCOPEN EQU   X'10'               OPEN HAS BEEN ISSUED FOR VTOC
+SHRDDASD EQU   X'08'               TARGET DASD IS GEN'ED AS SHARED
+DSNFOUND EQU   X'04'               THERE IS A DSN TO PROCESS
+FWARNMSG EQU   X'02'               FORCE WARNING MSG ISSUED
+*---------------------------------------------------------------------*
+RETCODE  DC    X'00'               RETURN CODE FLAGS
+RC04     EQU   X'80'
+RC08     EQU   X'40'
+RC12     EQU   X'20'
+         EJECT
+*---------------------------------------------------------------------*
+*              SUBROUTINE SAVE ARE AS                                 *
+*---------------------------------------------------------------------*
+SAVEAREA DS    18F
+LBL100SV DS    15F
+LBL200SV DS    15F
+LBL300SV DS    15F
+LBL400SV DS    15F
+LBL500SV DS    15F
+LBL600SV DS    15F
+LBL700SV DS    15F
+LBL800SV DS    15F
+LBL900SV DS    15F
+         EJECT
+*---------------------------------------------------------------------*
+*              CONTROL CARD FILE F OR DSF                             *
+*---------------------------------------------------------------------*
+SYSIN    DCB   DSORG=PS,MACRF=PM,DDNAME=SYSIN,LRECL=80,RECFM=F,        *
+               BLKSIZE=80
+         EJECT
+*---------------------------------------------------------------------*
+*              CONTROL CARD FILE                                      *
+*---------------------------------------------------------------------*
+CARDS    DCB   DSORG=PS,MACRF=GM,EODAD=LBL130,DDNAME=CARDS
+         EJECT
+*---------------------------------------------------------------------*
+*              DCB FOR VTOC                                           *
+*---------------------------------------------------------------------*
+VTOCDCB  DCB   DSORG=PS,MACRF=(R,W),DDNAME=VTOC,EXLST=JFCBADDR,        *
+               EODAD=LBL480,KEYLEN=44
+         EJECT
+*---------------------------------------------------------------------*
+*              REPORT FILE                                            *
+*---------------------------------------------------------------------*
+REPORT   DCB   DSORG=PS,MACRF=(PM),DDNAME=REPORT,LRECL=133,RECFM=FBA,  *
+               BLKSIZE=1330
+         EJECT
+*---------------------------------------------------------------------*
+*              PGM MESSAGES                                           *
+*---------------------------------------------------------------------*
+MSG1     DC    CL133' THE PROGRAM PARM FIELD IS INVALID. NOTHING OR "FO*
+               RCE" ARE THE ONLY VALID OPTIONS'
+MSG2     DC    CL133' NO INPUT RECORDS. TERMINATING'
+MSG3     DC    CL133' TOO MANY DSNAMES. TERMINATING'
+MSG4     DC    CL133' RDJFCB FOR VTOC DDNAME FAILED. TERMINATING'
+MSG5     DC    CL133' OPEN OF VTOC FAILED'
+MSG6     DC    CL133' UNEXPECTED RETURN CODE FROM CVAFTST MACRO. R15   *
+               CONTAINS THE RETURN CODE'
+MSG7     DC    CL133' BAD RETURN FROM DSF DISABLING VTOC INDEX'
+MSG8     DC    CL133' BAD RETURN FROM DSF ENABLING VTOC INDEX'
+MSG9     DC    CL133' DSN TOO LONG TO ADD SUFFIX. BYPASSED. DSN = 12345*
+               678901234567890123456789012345678901234'
+MSG10    DC    CL133' SCRATCH SUCCESSFUL FOR DSN 1234567890123456789012*
+               3456789012345678901234'
+MSG11    DC    CL133' DSN NOT FOUND IN VTOC. DSN = 12345678901234567890*
+               123456789012345678901234'
+MSG12    DC    CL133' DSN SCRATCHED  OK.    DSN = 123456789012345678901*
+               23456789012345678901234'
+MSG13    DC    CL133'DSN RENAMED BUT SCRATCH FAILED. DSN = 123456789012*
+               34567890123456789012345678901234'
+MSG14    DC    CL133' VOLUME XXXXX  IS A SHARED DASD. RESERVE ISSUED TO*
+                SERIALIZE ACCESS'
+MSG15    DC    CL133' VOLUME XXXXX  VTOC SUCCESSFULLY ENQUEUED'
+MSG16    DC    CL133' VOLUME XXXXX  VTOC SUCCESSFULLY DEQUEUED'
+MSG17    DC    CL133' VOLUME XXXXX  VTOC SUCCESSFULLY RELEASED'
+MSG18    DC    CL133' THE FOLLOWING DATASETS WERE PROCESSED'
+MSG19    DC    CL133' FORCE PARAMETER HAS BEEN SPECIFIED'
+MSG20    DC    CL133' OTHER USERS OF VOLUME BUT FORCE SPECIFIED. CONTIN*
+               UING'
+MSG21    DC    CL133' OTHER USERS OF VOLUME BUT FORCE NOT SPECIFIED. AB*
+               ORTING'
+MSG22    DC    CL133' NONE OF THE SELECTED DATASETS WERE FOUND ON THE T*
+               ARGET VOLUME'
+*---------------------------------------------------------------------*
+*              DSECTS                                                 *
+*---------------------------------------------------------------------*
+JFCB     DSECT
+         IEFJFCBN
+         IECSDSL1 1
+         DCBD  DSORG=PS
+         IEFUCBOB
+         IEZDEB
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2                   MOSTLY POINTS TO INPUT BUFFER DESCR
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10                  WORK AREA (UPDATEABLE STORAGE)
+R11      EQU   11                  2ND BASE REGISTER
+R12      EQU   12                  1ST BASE REGISTER
+R13      EQU   13                  REGISTER SAVE AREA
+R14      EQU   14                  STD USE
+R15      EQU   15                  STD USE
+         END

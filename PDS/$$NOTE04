@@ -1,0 +1,16 @@
+ New version of FILE 612
+Subject:  New version of FILE 612
+From:     Albert Chung Pang Cheng <albertcpcheng@hotmail.com>
+Date:     8/21/2024, 1:04 AM
+To:       Sam Golob <sbgolob@cbttape.org>
+
+Hi Sam,
+
+I added a new utility program DELINUSE that is used to delete a
+dataset which cannot be deleted by an IBM utility. For example a
+dataset is in use in VOLUME A but the same dataset name exists in
+VOLUME B. You cannot delete the dataset in VOLUME B because it is
+in use on volume Â  I also fixed bugs in utility DSPACE.
+
+Regards,
+Albert Cheng
